@@ -661,6 +661,81 @@ maybe_throttle_build(RObjBin, Limit, Wait, Acc) ->
             {Acc2, {Limit, Wait}}
     end.
 
+
+-define(SIDEJOB_REAPER_JOB_ID_BASE, 100500 + 42).
+-define(CHECK_REAPER_STATS_EVERY, 10).
+-define(MAX_REAPS_ON_QUEUE, 200).
+
+ensure_reaper() ->
+    Pid = get(sidejob_reaper_pid),
+    case process_info(Pid, [status]) of
+        undefined ->
+            {Mega, Sec, _} = os:timestamp(),
+            {ok, Pid1} = riak_kv_reaper:start_job(?SIDEJOB_REAPER_JOB_ID_BASE + Mega * 1000,000 + Sec),
+            put(sidejob_reaper_pid, Pid1),
+            spawn(fun() -> stop_reaper_when_done(Pid1) end),
+            lager:info("sidejob reaper ~p started", [Pid]),
+            Pid1;
+        _ ->
+            Pid
+    end.
+
+stop_reaper_when_done(Pid) ->
+    timer:sleep(60,000),
+    {_, _, {P1QSize, P2QSize}} = riak_kv_reaper:reap_stats(Pid),
+    if P1QSize + P2QSize == 0 ->
+            riak_kv_reaper:stop_job(Pid),
+            erase(sidejob_reaper_pid),
+            lager:info("sidejob reaper ~p terminated", [Pid]),
+            ok;
+       el/=se ->
+            stop_reaper_when_done(Pid)
+    end.
+
+reaper_accepting(Pid) ->
+    %% avoid checking stats too often
+    SkippedTimes =
+        case get(sidejob_reaper_skipped_stats_checks) of
+            undefined -> 0;
+            V0 -> V0
+        end,
+    LastResult =
+        case get(sidejob_reaper_last_check_result) of
+            undefined -> true;
+            V1 -> V1
+        end,
+    Result =
+        if SkippedTimes > ?CHECK_REAPER_STATS_EVERY ->
+                {_, _, {_P1QSize, P2QSize}} = riak_kv_reaper:reap_stats(Pid),
+                if P2QSize > ?MAX_REAPS_ON_QUEUE ->
+                        put(sidejob_reaper_skipped_stats_checks, 0),
+                        false;
+                   el/=se ->
+                        put(sidejob_reaper_skipped_stats_checks, SkippedTimes + 1),
+                        true
+                end;
+           el/=se ->
+                LastResult
+        end,
+    put(sidejob_reaper_last_check_result, Result),
+    Result.
+
+
+maybe_reap_tombstone(RObj, BKey) ->
+    ReaperPid = ensure_reaper(),
+    case reaper_accepting(ReaperPid) of
+        true ->
+            case riak_kv_util:is_x_deleted(RObj) of
+                true ->
+                    DeleteHash = riak_object:delete_hash(RObj),
+                    riak_kv_reaper:request_reap(ReaperPid, {BKey, DeleteHash});
+                false ->
+                    nop
+            end;
+        false ->
+            nop
+    end.
+
 %% @doc Generate the folding function
 %% for a riak fold_req
 -spec fold_fun(pid(), boolean()) -> fun().
@@ -669,6 +744,7 @@ fold_fun(HashtreePid, _HasIndexTree = false) ->
     fun(BKey, RObj, {Acc, {Limit, Wait}}) ->
             BinBKey = term_to_binary(BKey),
             ObjectFoldFun(BKey, RObj, BinBKey),
+            maybe_reap_tombstone(RObj, BKey),
             Acc2 = maybe_throttle_build(RObj, Limit, Wait, Acc),
             Acc2
     end;
