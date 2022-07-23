@@ -75,7 +75,8 @@
          get_max_reaps_on_queue/0,
          set_max_reaps_on_queue/1,
          ensure_reaper/0,
-         reaper_accepting/1]).
+         reaper_accepting/1,
+         sidejob_reaper_test/0]).
 
 -type index() :: non_neg_integer().
 -type index_n() :: {index(), non_neg_integer()}.
@@ -746,6 +747,8 @@ maybe_reap_tombstone(RObj, BKey) ->
                 true ->
                     case riak_kv_util:is_x_deleted(RObj) of
                         true ->
+                            [{_, NReaps}] = ets:lookup(sidejob_reaper_data, total_reaps),
+                            ets:insert(sidejob_reaper_data, {total_reaps, NReaps + 1}),
                             DeleteHash = riak_object:delete_hash(RObj),
                             riak_kv_reaper:request_reap(ReaperPid, {BKey, DeleteHash});
                         false ->
@@ -781,7 +784,8 @@ ensure_reaper_ets() ->
         undefined ->
             ets:new(sidejob_reaper_data, [public, named_table]),
             ets:insert(sidejob_reaper_data, [{max_reaps_on_queue, ?DEFAULT_MAX_REAPS_ON_QUEUE},
-                                             {reaper_enabled, true}]);
+                                             {reaper_enabled, true},
+                                             {total_reaps, 0}]);
         _ ->
             nop
     end.
@@ -792,9 +796,19 @@ sidejob_reaper_info() ->
             io:format("AAE Sidejob reaper not initialized. "
                       "It will be automatically initialized and started by the next AAE tree rebuild.\n", []);
         _ ->
-            [[{_, Enabled}], JobId_, Pid_, [{_, MaxReapsOnQueue}], StartedTime_] =
+            [[{_, Enabled}],
+             JobId_,
+             Pid_,
+             [{_, MaxReapsOnQueue}],
+             StartedTime_,
+             TotalReaps_] =
                 [ets:lookup(sidejob_reaper_data, A)
-                 || A <- [reaper_enabled, reaper_jobid, reaper_pid, max_reaps_on_queue, started_time]],
+                 || A <- [reaper_enabled,
+                          reaper_jobid,
+                          reaper_pid,
+                          max_reaps_on_queue,
+                          started_time,
+                          total_reaps]],
             case StartedTime_ of
                 [] ->
                     io:format("AAE Sidejob reaper has not been started\n", []);
@@ -802,6 +816,7 @@ sidejob_reaper_info() ->
                     [{_, Pid}] = Pid_,
                     [{_, JobId}] = JobId_,
                     [{_, StartedTime}] = StartedTime_,
+                    [{_, TotalReaps}] = TotalReaps_,
                     {_, _, {_P1QSize, P2QSize}} = riak_kv_reaper:reap_stats(Pid),
                     io:format("AAE Sidejob reaper stats:\n"
                               "=========================\n"
@@ -809,12 +824,22 @@ sidejob_reaper_info() ->
                               "Started: ~p\n"
                               "Reaper job id: ~b\n"
                               "Reaper pid: ~p\n"
-                              "Reaper current/max queue: ~b/~b\n",
+                              "Reaper current/max queue: ~b/~b\n"
+                              "Total reaps: ~b\n",
                               [Enabled, StartedTime,
                                JobId, Pid,
-                               P2QSize, MaxReapsOnQueue])
+                               P2QSize, MaxReapsOnQueue, TotalReaps])
             end
     end.
+
+sidejob_reaper_test() ->
+    sidejob_reaper_test(1000).
+sidejob_reaper_test(0) ->
+    ok;
+sidejob_reaper_test(N) ->
+    {B,K} = {<<"b">>, <<"k">>},
+    maybe_reap_tombstone(riak_object:new(B, K, <<"V">>), {B, K}),
+    sidejob_reaper_test(N-1).
 
 %% @doc Generate the folding function
 %% for a riak fold_req
