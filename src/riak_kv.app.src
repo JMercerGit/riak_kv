@@ -22,7 +22,6 @@
                   riak_ensemble,
                   exometer_core,
                   hyper,
-                  redbug,
                   recon,
                   riakc,
                   rhc,
